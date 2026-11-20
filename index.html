@@ -50,6 +50,7 @@
   }
   .crop > img { object-fit: cover; }
   .crop > #yt { opacity: 0; filter: none; } /* the video has its own backgrounds: no key */
+  body.card:not(.armed):not(.party) .crop > #yt { pointer-events: auto; cursor: pointer; } /* catches the first tap */
   body.party.live .cat { width: min(92vw, 600px, 62vh); }
   /* shows x 18-82%, y 15-84% of the video: the cat, without YouTube's title bar / logo / "More videos" strip */
   body.party.live .cat .crop { aspect-ratio: 1.649; border-radius: 22px; box-shadow: 0 0 0 4px #fff9, 0 18px 40px rgba(0,0,0,.5); }
@@ -258,15 +259,20 @@
 (() => {
   const $ = id => document.getElementById(id);
 
-  // ---------- share-link codec: #1<base64url(JSON)> ----------
-  // JSON keys: i = invite line, t = big reveal, f = signed (optional), n = nonce (makes every created link unique)
+  // ---------- share-link codec ----------
+  // #2<base64url(invite US reveal [US signed])>  (US = \x1f). Older #1<base64url(JSON {i,t,f})> links still open.
+  const SEP = '\x1f';
   const b64url = bytes => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
   const fromB64url = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/') + '==='.slice((s.length + 3) % 4)), c => c.charCodeAt(0));
-  function encode(card) { return '1' + b64url(new TextEncoder().encode(JSON.stringify(card))); }
+  function encode(card) { return '2' + b64url(new TextEncoder().encode([card.i, card.t].concat(card.f ? [card.f] : []).join(SEP))); }
   function decode(code) {
     try {
-      if (!code || code[0] !== '1') return null;
-      const c = JSON.parse(new TextDecoder().decode(fromB64url(code.slice(1))));
+      if (!code) return null;
+      const text = new TextDecoder().decode(fromB64url(code.slice(1)));
+      let c;
+      if (code[0] === '2') { const [i = '', t = '', f = ''] = text.split(SEP); c = { i, t, f }; }
+      else if (code[0] === '1') c = JSON.parse(text);
+      else return null;
       if (typeof c.i !== 'string' || typeof c.t !== 'string' || !c.t.trim()) return null;
       return { i: c.i.slice(0, 60), t: c.t.slice(0, 60), f: typeof c.f === 'string' ? c.f.slice(0, 40) : '' };
     } catch (e) { return null; }
@@ -300,8 +306,7 @@
       const i = $('fInvite').value.trim(), t = $('fTitle').value.trim(), f = $('fFrom').value.trim();
       if (!i || !t) { $('err').textContent = 'Fill in 01 and 02 first.'; ($('fInvite').value.trim() ? $('fTitle') : $('fInvite')).focus(); return; }
       $('err').textContent = '';
-      const n = Math.random().toString(36).slice(2, 6);
-      const url = location.origin + location.pathname + '#' + encode(f ? { i, t, f, n } : { i, t, n });
+      const url = location.origin + location.pathname + '#' + encode({ i, t, f });
       $('link').value = url; $('tryLink').href = url;
       $('result').classList.remove('hidden');
       $('link').focus(); $('link').select();
@@ -350,8 +355,16 @@
     $('l2').style.fontSize = `min(150px, 18vw, ${(92 / ([...big].length * 0.66)).toFixed(1)}vw)`;
 
     // ---------- the original song, via the official YouTube player ----------
-    let player = null, ready = false, primed = false, failed = false, muted = false, pauseT = null, lastClick = 0;
+    // Sound rule: browsers (phones especially) only start a cross-site player WITH SOUND when the tap
+    // lands inside the player frame. So until the first tap, the invisible player sits on top of the cat
+    // and catches it ("armed" = that happened); after that, clicks go to the cat and the song keeps looping.
+    let player = null, ready = false, primed = false, failed = false, muted = false, armed = false, pauseT = null, lastClick = 0;
     const S = () => (window.YT && YT.PlayerState) || {};
+    function arm() {
+      if (armed) return false;
+      armed = true; body.classList.add('armed');
+      return true;
+    }
     window.onYouTubeIframeAPIReady = () => {
       player = new YT.Player('yt', {
         videoId: VID,
@@ -360,17 +373,26 @@
           onReady: () => {
             if (failed) return;
             ready = true; body.classList.add('yt-ok');
-            // run the opening loop muted from the start; clicks only unmute it, so sound is instant
-            try { player.mute(); player.playVideo(); } catch (e) {}
           },
           onError: () => { failed = true; body.classList.remove('live'); },
           onStateChange: e => {
-            if (e.data === S().PLAYING) primed = true;
+            if (e.data === S().PLAYING) {
+              primed = true;
+              if (arm() && !partying && clicks === 0) onCat({}); // the tap that started it counts as click 1
+            }
             if (e.data === S().ENDED) { player.seekTo(0, true); player.playVideo(); }
           },
         },
       });
     };
+    // a tap inside the player frame moves focus into it: that's our first click
+    addEventListener('blur', () => setTimeout(() => {
+      const f = document.getElementById('yt');
+      if (f && f.tagName === 'IFRAME' && document.activeElement === f && !partying && arm()) {
+        onCat({});
+        f.blur(); // hand focus back to the page without drawing the keyboard focus ring on the cat
+      }
+    }, 0));
     const api = document.createElement('script');
     api.src = 'https://www.youtube.com/iframe_api';
     api.onerror = () => { failed = true; };
@@ -390,15 +412,15 @@
         if (st !== S().PLAYING && st !== S().BUFFERING) player.playVideo();
       } catch (e) {}
     }
-    // spam clicking = continuous OIIA: each click unmutes the running loop; it goes quiet 350ms after
-    // the last click. Never paused/seeked away from the buffer, so there is no rebuffer delay.
+    // once started, the OIIA opening loops while they click; no pausing or muting (each would need
+    // a fresh in-frame tap on phones). play() covers desktop browsers that let the page start it.
     function oiia() {
       lastClick = performance.now();
-      sound(true); play(); // play() only matters if muted autoplay was refused; the click is a user gesture
+      if (!muted) sound(true);
+      play();
     }
     setInterval(() => {
       if (partying || !ready) return;
-      if (performance.now() - lastClick > 350) sound(false);
       try { if (player.getCurrentTime() > HOOK_END) player.seekTo(0, true); } catch (e) {}
     }, 100);
 
@@ -490,6 +512,7 @@
     }
     function reset() {
       partying = false; clicks = 0;
+      armed = false; body.classList.remove('armed'); // paused again: next tap must go into the player
       clearInterval(miniTimer);
       if (ready) try { player.pauseVideo(); player.seekTo(0, true); } catch (e) {}
       document.querySelectorAll('.mini').forEach(m => m.remove());
@@ -505,13 +528,13 @@
     $('againBtn').addEventListener('click', reset);
     $('muteBtn').addEventListener('click', () => {
       muted = !muted;
-      sound(!muted && (partying || performance.now() - lastClick < 350));
+      sound(!muted);
       $('muteBtn').textContent = muted ? '🔇 Unmute' : '🔊 Mute';
     });
 
     // read-only state for automated checks
     window.__bday = {
-      get clicks() { return clicks; }, get partying() { return partying; }, get ready() { return ready; }, get primed() { return primed; },
+      get clicks() { return clicks; }, get partying() { return partying; }, get ready() { return ready; }, get primed() { return primed; }, get armed() { return armed; },
       get failed() { return failed; },
       get state() { try { return player.getPlayerState(); } catch (e) { return null; } },
       get muted() { try { return player.isMuted(); } catch (e) { return null; } },
